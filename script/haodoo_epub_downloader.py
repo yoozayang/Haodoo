@@ -74,6 +74,13 @@ class BookEntry:
         }
 
 
+class DownloadAsset:
+    def __init__(self, url: str, name: str, media_type: str):
+        self.url = url
+        self.name = name
+        self.media_type = media_type
+
+
 def get_html(session: requests.Session, url: str, timeout: int) -> str:
     resp = session.get(url, timeout=timeout)
     resp.raise_for_status()
@@ -194,12 +201,37 @@ def extract_author_title_from_html(html: str) -> Tuple[str, str]:
         author = normalize_space(match.group(1))
         title = normalize_space(match.group(2))
         return author, title
+    title_match = re.search(r'SetTitle\("([^"]+)"\)', html)
+    if title_match:
+        raw = normalize_space(title_match.group(1))
+        bracket = re.match(r"^(?P<author>[^【]+)【(?P<title>[^】]+)】", raw)
+        if bracket:
+            return normalize_space(bracket.group("author")), normalize_space(bracket.group("title"))
+        angle = re.match(r"^(?P<author>[^《]+)《(?P<title>[^》]+)》", raw)
+        if angle:
+            return normalize_space(angle.group("author")), normalize_space(angle.group("title"))
     return "", ""
 
 
-def find_download_link(book_url: str, session: requests.Session, timeout: int) -> Tuple[str, str, str, str]:
+def find_download_assets(
+    book_url: str, session: requests.Session, timeout: int
+) -> Tuple[List[DownloadAsset], str, str]:
     html = get_html(session, book_url, timeout)
     page_author, page_title = extract_author_title_from_html(html)
+
+    soup = BeautifulSoup(html, "html.parser")
+    audio_sources = []
+    for source in soup.find_all("source", src=True):
+        src = source["src"].strip()
+        if src.lower().endswith(".mp3"):
+            audio_sources.append(urljoin(book_url, src))
+
+    if audio_sources:
+        assets = []
+        for src in audio_sources:
+            name = os.path.basename(urlparse(src).path)
+            assets.append(DownloadAsset(src, name, "mp3"))
+        return assets, page_author, page_title
 
     ve_match = re.search(r"DownloadVEpub\('([^']+)'\)", html)
     e_match = re.search(r"DownloadEpub\('([^']+)'\)", html)
@@ -212,9 +244,8 @@ def find_download_link(book_url: str, session: requests.Session, timeout: int) -
     if book_code:
         download_url = f"https://www.haodoo.net/PDB/{book_code[0]}/{book_code[1:]}.epub"
         download_name = f"{book_code}.epub"
-        return download_url, download_name, page_author, page_title
+        return [DownloadAsset(download_url, download_name, "epub")], page_author, page_title
 
-    soup = BeautifulSoup(html, "html.parser")
     candidates = []
     for link in soup.find_all("a", href=True):
         text = normalize_space(link.get_text()).lower()
@@ -233,11 +264,11 @@ def find_download_link(book_url: str, session: requests.Session, timeout: int) -
 
     final = preferred or fallback
     if not final:
-        return "", "", page_author, page_title
+        return [], page_author, page_title
     download_url = urljoin(book_url, final)
     parsed = urlparse(download_url)
     download_name = os.path.basename(parsed.path)
-    return download_url, download_name, page_author, page_title
+    return [DownloadAsset(download_url, download_name, "epub")], page_author, page_title
 
 
 def write_csv(path: str, rows: Iterable[Dict[str, str]]) -> None:
@@ -305,14 +336,28 @@ def crawl(
         category_name = category["category"]
         category_url = category["url"]
         for entry in extract_book_links(category_name, category_url, session, timeout):
-            download_url, download_name, page_author, page_title = find_download_link(entry.book_url, session, timeout)
-            entry.download_url = download_url
-            entry.download_name = download_name
+            assets, page_author, page_title = find_download_assets(entry.book_url, session, timeout)
             if page_author and not entry.author:
                 entry.author = page_author
             if page_title and (not entry.title or entry.title == page_title or "【" in entry.title):
                 entry.title = page_title
-            entries.append(entry)
+
+            if assets:
+                for asset in assets:
+                    item = BookEntry(
+                        category=entry.category,
+                        author=entry.author,
+                        title=entry.title,
+                        book_url=entry.book_url,
+                        download_url=asset.url,
+                        download_name=asset.name,
+                    )
+                    entries.append(item)
+                    if max_books and max_books > 0 and len(entries) >= max_books:
+                        break
+            else:
+                entries.append(entry)
+
             if max_books and max_books > 0 and len(entries) >= max_books:
                 break
         if max_books and max_books > 0 and len(entries) >= max_books:
@@ -334,9 +379,10 @@ def ensure_download_info(
     if not book_url:
         row["status"] = "no_book_url"
         return
-    download_url, download_name, page_author, page_title = find_download_link(book_url, session, timeout)
-    row["download_url"] = download_url
-    row["download_name"] = download_name
+    assets, page_author, page_title = find_download_assets(book_url, session, timeout)
+    if assets:
+        row["download_url"] = assets[0].url
+        row["download_name"] = assets[0].name
     if page_author and not row.get("author"):
         row["author"] = page_author
     if page_title and (not row.get("title") or "【" in row.get("title", "")):
@@ -373,9 +419,13 @@ def download_from_csv(
         author = safe_filename(row.get("author", ""), "UnknownAuthor")
         title = safe_filename(row.get("title", ""), "UnknownTitle")
 
-        filename = f"{author} - {title}.epub"
-        if not filename.lower().endswith(".epub"):
-            filename += ".epub"
+        download_name = row.get("download_name", "")
+        if download_name.lower().endswith(".mp3"):
+            filename = f"{author} - {title} - {download_name}"
+        else:
+            filename = f"{author} - {title}.epub"
+            if not filename.lower().endswith(".epub"):
+                filename += ".epub"
 
         dest_dir = os.path.join(download_root, category, author)
         dest_path = os.path.join(dest_dir, filename)
