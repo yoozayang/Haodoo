@@ -41,6 +41,8 @@ python script/haodoo_epub_downloader.py --download --output haodoo_books.csv
 - `--sleep`：每本下載完成後的等待秒數，預設 `2.0`
 - `--timeout`：單一 HTTP 請求逾時秒數，預設 `20`
 - `--user-agent`：自訂 User-Agent
+- `--max-categories`：爬蟲最多抓取幾個分類（預設 0 = 不限）
+- `--max-books`：爬蟲最多抓取幾本書（預設 0 = 不限）
 - `--crawl`：只爬清單
 - `--download`：只下載（從 CSV 讀取）
 
@@ -65,3 +67,7 @@ category,author,title,book_url,download_url,download_name,status,filepath,error
 - 下載時會在每本完成後更新 CSV
 - 若遇到連線拒絕或 403/429/503 等狀態碼，會標記 `blocked` 並停止
 - 重新執行 `--download` 會從尚未完成的項目續傳
+
+## 作者/書名來源
+- 以書籍頁內的 `作者《書名》` 標記為準
+- 若分類頁未提供作者，會自動從書籍頁補上

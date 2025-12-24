@@ -166,7 +166,8 @@ def extract_book_links(
         if parsed.netloc and "haodoo.net" not in parsed.netloc:
             continue
         params = parse_qs(parsed.query)
-        if params.get("M", [""])[0] == "hd":
+        mode = params.get("M", [""])[0].lower()
+        if mode not in {"book", "share"}:
             continue
 
         author, title = split_author_title(text)
@@ -187,8 +188,32 @@ def extract_book_links(
     return entries
 
 
-def find_download_link(book_url: str, session: requests.Session, timeout: int) -> Tuple[str, str]:
+def extract_author_title_from_html(html: str) -> Tuple[str, str]:
+    match = re.search(r">\s*([^<]+?)\s*</font>\s*《\s*([^》]+?)\s*》", html)
+    if match:
+        author = normalize_space(match.group(1))
+        title = normalize_space(match.group(2))
+        return author, title
+    return "", ""
+
+
+def find_download_link(book_url: str, session: requests.Session, timeout: int) -> Tuple[str, str, str, str]:
     html = get_html(session, book_url, timeout)
+    page_author, page_title = extract_author_title_from_html(html)
+
+    ve_match = re.search(r"DownloadVEpub\('([^']+)'\)", html)
+    e_match = re.search(r"DownloadEpub\('([^']+)'\)", html)
+    book_code = ""
+    if ve_match:
+        book_code = ve_match.group(1)
+    elif e_match:
+        book_code = e_match.group(1)
+
+    if book_code:
+        download_url = f"https://www.haodoo.net/PDB/{book_code[0]}/{book_code[1:]}.epub"
+        download_name = f"{book_code}.epub"
+        return download_url, download_name, page_author, page_title
+
     soup = BeautifulSoup(html, "html.parser")
     candidates = []
     for link in soup.find_all("a", href=True):
@@ -208,11 +233,11 @@ def find_download_link(book_url: str, session: requests.Session, timeout: int) -
 
     final = preferred or fallback
     if not final:
-        return "", ""
+        return "", "", page_author, page_title
     download_url = urljoin(book_url, final)
     parsed = urlparse(download_url)
     download_name = os.path.basename(parsed.path)
-    return download_url, download_name
+    return download_url, download_name, page_author, page_title
 
 
 def write_csv(path: str, rows: Iterable[Dict[str, str]]) -> None:
@@ -269,17 +294,29 @@ def crawl(
     output_csv: str,
     session: requests.Session,
     timeout: int,
+    max_categories: int = 0,
+    max_books: int = 0,
 ) -> List[Dict[str, str]]:
     entries: List[BookEntry] = []
     categories = extract_categories(start_url, session, timeout)
+    if max_categories and max_categories > 0:
+        categories = categories[:max_categories]
     for category in categories:
         category_name = category["category"]
         category_url = category["url"]
         for entry in extract_book_links(category_name, category_url, session, timeout):
-            download_url, download_name = find_download_link(entry.book_url, session, timeout)
+            download_url, download_name, page_author, page_title = find_download_link(entry.book_url, session, timeout)
             entry.download_url = download_url
             entry.download_name = download_name
+            if page_author and not entry.author:
+                entry.author = page_author
+            if page_title and (not entry.title or entry.title == page_title or "【" in entry.title):
+                entry.title = page_title
             entries.append(entry)
+            if max_books and max_books > 0 and len(entries) >= max_books:
+                break
+        if max_books and max_books > 0 and len(entries) >= max_books:
+            break
 
     rows = [entry.to_row() for entry in entries]
     write_csv(output_csv, rows)
@@ -297,9 +334,13 @@ def ensure_download_info(
     if not book_url:
         row["status"] = "no_book_url"
         return
-    download_url, download_name = find_download_link(book_url, session, timeout)
+    download_url, download_name, page_author, page_title = find_download_link(book_url, session, timeout)
     row["download_url"] = download_url
     row["download_name"] = download_name
+    if page_author and not row.get("author"):
+        row["author"] = page_author
+    if page_title and (not row.get("title") or "【" in row.get("title", "")):
+        row["title"] = page_title
 
 
 def download_from_csv(
@@ -373,6 +414,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--sleep", type=float, default=DEFAULT_SLEEP)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
+    parser.add_argument("--max-categories", type=int, default=0, help="Limit categories for crawl (0 = no limit)")
+    parser.add_argument("--max-books", type=int, default=0, help="Limit total books for crawl (0 = no limit)")
     parser.add_argument("--crawl", action="store_true", help="Only crawl and build CSV")
     parser.add_argument("--download", action="store_true", help="Only download using CSV")
     return parser.parse_args(argv)
@@ -389,7 +432,14 @@ def main() -> int:
     try:
         rows = []
         if do_crawl:
-            rows = crawl(args.start_url, args.output, session, args.timeout)
+            rows = crawl(
+                args.start_url,
+                args.output,
+                session,
+                args.timeout,
+                max_categories=args.max_categories,
+                max_books=args.max_books,
+            )
             print(f"Crawl complete: {len(rows)} items -> {args.output}")
         if do_download:
             download_from_csv(
